@@ -57,6 +57,60 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const RELATIVE_TIME_PATTERN = /^-(\d+)(s|m|h|d|w)$/i;
+const RELATIVE_TIME_UNITS_MS: Record<string, number> = {
+  s: 1_000,
+  m: 60_000,
+  h: 3_600_000,
+  d: 86_400_000,
+  w: 604_800_000,
+};
+
+// Sumo's Search Job API accepts only ISO 8601 (e.g. "2026-05-07T10:00:00")
+// or epoch milliseconds. Translate "-15m" / "now" into epoch ms so the user
+// can keep using the relative shorthand the rest of Sumo's UI accepts.
+function normalizeTime(input: string | undefined, fallback: string): string {
+  const raw = (input ?? fallback).trim();
+  if (raw.length === 0) return normalizeTime(fallback, fallback);
+
+  if (raw.toLowerCase() === 'now') return String(Date.now());
+
+  const rel = RELATIVE_TIME_PATTERN.exec(raw);
+  if (rel) {
+    const amount = parseInt(rel[1], 10);
+    const unit = rel[2].toLowerCase();
+    return String(Date.now() - amount * RELATIVE_TIME_UNITS_MS[unit]);
+  }
+
+  // Pass through: digits are treated as epoch ms, anything else as ISO 8601.
+  // Sumo will return a 400 if the format is wrong and our error mapper surfaces it.
+  return raw;
+}
+
+// Sumo's API uses sticky sessions: the POST that creates a job sets cookies
+// that route subsequent GETs to the same node. Without those cookies, follow-up
+// polls hit a different node and return 404 searchjob.jobid.invalid.
+class CookieJar {
+  private readonly cookies = new Map<string, string>();
+
+  capture(headers: Headers): void {
+    const list = (headers as { getSetCookie?: () => string[] }).getSetCookie?.();
+    if (!list) return;
+    for (const setCookie of list) {
+      const semi = setCookie.indexOf(';');
+      const pair = semi < 0 ? setCookie : setCookie.slice(0, semi);
+      const eq = pair.indexOf('=');
+      if (eq < 1) continue;
+      this.cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+  }
+
+  header(): string | undefined {
+    if (this.cookies.size === 0) return undefined;
+    return [...this.cookies].map(([n, v]) => `${n}=${v}`).join('; ');
+  }
+}
+
 interface SumoResponse {
   status: number;
   body: unknown;
@@ -67,6 +121,7 @@ async function sumoFetch(
   method: string,
   path: string,
   body?: unknown,
+  jar?: CookieJar,
 ): Promise<SumoResponse> {
   const url = `${config.endpoint}${path}`;
   const headers: Record<string, string> = {
@@ -74,6 +129,10 @@ async function sumoFetch(
     Accept: 'application/json',
   };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (jar) {
+    const cookie = jar.header();
+    if (cookie) headers['Cookie'] = cookie;
+  }
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT_MS);
@@ -96,6 +155,8 @@ async function sumoFetch(
     clearTimeout(timeout);
   }
 
+  if (jar) jar.capture(response.headers);
+
   const text = await response.text();
   let parsed: unknown = null;
   if (text.length > 0) {
@@ -113,10 +174,11 @@ async function sumoFetchWithRetry(
   method: string,
   path: string,
   body?: unknown,
+  jar?: CookieJar,
 ): Promise<SumoResponse> {
   let attempt = 0;
   while (true) {
-    const result = await sumoFetch(config, method, path, body);
+    const result = await sumoFetch(config, method, path, body, jar);
     if (result.status !== 429) return result;
     if (attempt >= RATE_LIMIT_RETRIES) {
       throw new SumoError('Rate limited by Sumo.');
@@ -174,16 +236,19 @@ async function searchLogs(
   const max = Math.min(input.max_results ?? 100, MAX_RESULTS_LIMIT);
   const jobBody = {
     query: input.query,
-    from: input.from ?? '-15m',
-    to: input.to ?? 'now',
+    from: normalizeTime(input.from, '-15m'),
+    to: normalizeTime(input.to, 'now'),
     timeZone: input.timezone ?? 'UTC',
   };
+
+  const jar = new CookieJar();
 
   const create = await sumoFetchWithRetry(
     config,
     'POST',
     '/api/v1/search/jobs',
     jobBody,
+    jar,
   );
   if (create.status >= 400) throw mapError(create.status, create.body);
 
@@ -207,6 +272,8 @@ async function searchLogs(
         config,
         'GET',
         `/api/v1/search/jobs/${jobId}`,
+        undefined,
+        jar,
       );
       if (status.status >= 400) throw mapError(status.status, status.body);
 
@@ -225,6 +292,8 @@ async function searchLogs(
       config,
       'GET',
       `/api/v1/search/jobs/${jobId}/messages?offset=0&limit=${max}`,
+      undefined,
+      jar,
     );
     if (results.status >= 400) throw mapError(results.status, results.body);
 
@@ -243,7 +312,7 @@ async function searchLogs(
     });
   } finally {
     try {
-      await sumoFetch(config, 'DELETE', `/api/v1/search/jobs/${jobId}`);
+      await sumoFetch(config, 'DELETE', `/api/v1/search/jobs/${jobId}`, undefined, jar);
     } catch {
       // best-effort cleanup; intentionally swallowed
     }
@@ -265,11 +334,11 @@ async function main(): Promise<void> {
       from: z
         .string()
         .optional()
-        .describe('Start time. ISO 8601 (e.g. "2026-05-07T10:00:00") or Sumo relative ("-15m", "-1h", "-1d", "now"). Default "-15m".'),
+        .describe('Start time. Accepts ISO 8601 without timezone designator (e.g. "2026-05-07T10:00:00"), epoch milliseconds (e.g. "1746615600000"), or relative shorthand "now" / "-<N><unit>" where unit is s|m|h|d|w (e.g. "-15m", "-1h", "-7d"). Default "-15m".'),
       to: z
         .string()
         .optional()
-        .describe('End time. Same format as `from`. Default "now".'),
+        .describe('End time. Same formats as `from`. Default "now".'),
       max_results: z
         .number()
         .int()

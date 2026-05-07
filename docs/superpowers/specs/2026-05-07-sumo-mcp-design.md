@@ -37,7 +37,7 @@ One tool: `search_logs`
 | Param | Type | Default | Notes |
 |-------|------|---------|-------|
 | `query` | string | required | Sumo Logic search expression |
-| `from` | string | `"-15m"` | ISO 8601 or Sumo relative (`"-1h"`, `"now"`); passed through to Sumo verbatim |
+| `from` | string | `"-15m"` | ISO 8601 (`"2026-05-07T10:00:00"`), epoch ms, or relative (`"now"`, `"-<N>{s,m,h,d,w}"`). Sumo's API only accepts ISO 8601 / epoch ms, so relative values are translated to epoch ms before send |
 | `to` | string | `"now"` | Same format rules as `from` |
 | `max_results` | number | 100 | Capped at 1000 |
 | `timezone` | string | `"UTC"` | Sent to Sumo as the search timezone |
@@ -62,6 +62,8 @@ Standard async search-job dance:
 4. `DELETE {endpoint}/api/v1/search/jobs/{id}` — best-effort, non-fatal if it fails
 
 Auth on every request: `Authorization: Basic ${base64(access_id + ':' + access_key)}`.
+
+Sumo uses sticky sessions for the search-job lifecycle: cookies set on the POST response must accompany the polling and result-fetch requests, otherwise follow-ups return `404 searchjob.jobid.invalid` (the request lands on a node that doesn't know about the job). A per-job in-memory cookie jar carries them through the four calls.
 
 ## Configuration
 
