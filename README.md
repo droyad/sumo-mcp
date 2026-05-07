@@ -11,6 +11,17 @@ npm run build
 
 ## Configure in Claude Code
 
+## API Key
+In Sumo:
+- Click on your username and select `Personal Access Keys`
+- Click `Add New Access Key`
+- Enter a name, e.g. `Claude Local`
+- Select `Custom` under scope
+- Check `Run Log Search` under the `Log Search` section
+- Save the key
+
+## Install
+
 ```powershell
 claude mcp add --scope user sumo `
   --env SUMO_ACCESS_ID=<your-access-id> `
@@ -19,7 +30,7 @@ claude mcp add --scope user sumo `
   -- node C:\Source\SumoMcp\dist\index.js
 ```
 
-`SUMO_ENDPOINT` must match `https://api*.sumologic.com`. Pick the host for your Sumo deployment region (US2, EU, AU, etc.).
+`SUMO_ENDPOINT` must match `https://api.*.sumologic.com`. Pick the host for your Sumo deployment region (US2, EU, AU, etc.).
 
 ## Tool
 
